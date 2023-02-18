@@ -81,6 +81,7 @@ typedef struct HashPageOpaqueData
 	Bucket		hasho_bucket;	/* bucket number this pg belongs to */
 	uint16		hasho_flag;		/* page type code + flag bits, see above */
 	uint16		hasho_page_id;	/* for identification of hash indexes */
+	uint8			control[MaxIndexTuplesPerPage];	/* for hashcode control byte storage */s
 } HashPageOpaqueData;
 
 typedef HashPageOpaqueData *HashPageOpaque;
@@ -357,6 +358,8 @@ typedef struct HashOptions
 #define HASHOPTIONS_PROC		3
 #define HASHNProcs				3
 
+#define HASHKEY_CTL_MASK	0xFF000000
+#define HASHKEY_GETCTL(key)	(key & HASHKEY_CTL_MASK)
 
 /* public routines */
 
@@ -472,6 +475,7 @@ extern BlockNumber _hash_get_newblock_from_oldbucket(Relation rel, Bucket old_bu
 extern Bucket _hash_get_newbucket_from_oldbucket(Relation rel, Bucket old_bucket,
 												 uint32 lowmask, uint32 maxbucket);
 extern void _hash_kill_items(IndexScanDesc scan);
+extern void _hash_multi_delete_ctl(Page page, OffsetNumber* itemnos, int nitems);
 
 /* hash.c */
 extern void hashbucketcleanup(Relation rel, Bucket cur_bucket,

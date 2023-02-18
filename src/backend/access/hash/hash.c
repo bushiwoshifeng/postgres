@@ -793,6 +793,7 @@ hashbucketcleanup(Relation rel, Bucket cur_bucket, Buffer bucket_buf,
 			/* No ereport(ERROR) until changes are logged */
 			START_CRIT_SECTION();
 
+			_hash_multi_delete_ctl(page, deletable, ndeletable);
 			PageIndexMultiDelete(page, deletable, ndeletable);
 			bucket_dirty = true;
 

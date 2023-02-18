@@ -620,3 +620,33 @@ _hash_kill_items(IndexScanDesc scan)
 	else
 		_hash_relbuf(rel, buf);
 }
+
+/*
+ * _hash_multi_delete_ctl
+ * delete control byte from hash page opaque data, according to itemnos
+ */
+void
+_hash_multi_delete_ctl(Page page, OffsetNumber* itemnos, int nitems)
+{
+	uint8 newitemctl[MaxIndexTuplesPerPage];
+	int nline, nused, nextitm;
+	OffsetNumber offnum;
+	HashPageOpaque pageopaque;
+
+	nline = PageGetMaxOffsetNumber(page);
+	nextitm = 0;
+	nused = 0;
+	pageopaque = HashPageGetOpaque(page);
+
+	for(offnum = 1; offnum <= nline; offnum = OffsetNumberNext(offnum))
+	{
+		if(nextitm < nitems && offnum == itemnos[nextitm]){
+			nextitm++;
+			continue;
+		}
+		newitemctl[nused++] = pageopaque->control[offnum - 1];
+	}
+
+	if(nused > 0)
+		memcpy(pageopaque->control, newitemctl, nused * sizeof(uint8));
+}

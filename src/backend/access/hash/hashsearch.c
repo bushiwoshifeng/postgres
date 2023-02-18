@@ -14,17 +14,22 @@
  */
 #include "postgres.h"
 
+#include <immintrin.h>
+
 #include "access/hash.h"
 #include "access/relscan.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/predicate.h"
 #include "utils/rel.h"
+#include "port/pg_bitutils.h"
 
 static bool _hash_readpage(IndexScanDesc scan, Buffer *bufP,
 						   ScanDirection dir);
 static int	_hash_load_qualified_items(IndexScanDesc scan, Page page,
 									   OffsetNumber offnum, ScanDirection dir);
+static int	_hash_load_qualified_items_avx512(IndexScanDesc scan, Page page, ScanDirection dir);
+static inline uint64 _hash_match_ctl(uint8* pctl, char ctl2match);
 static inline void _hash_saveitem(HashScanOpaque so, int itemIndex,
 								  OffsetNumber offnum, IndexTuple itup);
 static void _hash_readnext(IndexScanDesc scan, Buffer *bufp,
@@ -475,9 +480,9 @@ _hash_readpage(IndexScanDesc scan, Buffer *bufP, ScanDirection dir)
 		for (;;)
 		{
 			/* new page, locate starting position by binary search */
-			offnum = _hash_binsearch(page, so->hashso_sk_hash);
+			// offnum = _hash_binsearch(page, so->hashso_sk_hash);
 
-			itemIndex = _hash_load_qualified_items(scan, page, offnum, dir);
+			itemIndex = _hash_load_qualified_items_avx512(scan, page, dir);
 
 			if (itemIndex != 0)
 				break;
@@ -534,9 +539,9 @@ _hash_readpage(IndexScanDesc scan, Buffer *bufP, ScanDirection dir)
 		for (;;)
 		{
 			/* new page, locate starting position by binary search */
-			offnum = _hash_binsearch_last(page, so->hashso_sk_hash);
+			// offnum = _hash_binsearch_last(page, so->hashso_sk_hash);
 
-			itemIndex = _hash_load_qualified_items(scan, page, offnum, dir);
+			itemIndex = _hash_load_qualified_items_avx512(scan, page, dir);
 
 			if (itemIndex != MaxIndexTuplesPerPage)
 				break;
@@ -707,6 +712,115 @@ _hash_load_qualified_items(IndexScanDesc scan, Page page,
 		Assert(itemIndex >= 0);
 		return itemIndex;
 	}
+}
+
+static int
+_hash_load_qualified_items_avx512(IndexScanDesc scan, Page page, ScanDirection dir)
+{
+	HashScanOpaque so = (HashScanOpaque) scan->opaque;
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page), offnum;
+	int itemIndex, kwidth, mindex, i, j, k;
+	HashPageOpaque pageopaque = HashPageGetOpaque(page);
+	uint8 tmp[64];
+	uint64 mmask[(MaxIndexTuplesPerPage +63) / 64];
+	char key2match;
+	IndexTuple	itup;
+
+	mindex = 0;
+	offnum = 1;
+	kwidth = 64;	// 512/8
+	key2match = HASHKEY_GETCTL(so->hashso_sk_hash);
+	
+	while(offnum <= maxoff)
+	{
+		if(offnum + kwidth -1 > maxoff)
+		{
+			for(int i = 0;i < maxoff - offnum + 1; i++)
+				tmp[i] = pageopaque->control[offnum + i - 1];
+			mmask[mindex++] = _hash_match_ctl(tmp, key2match);
+		}
+		else
+		{
+			mmask[mindex++] = _hash_match_ctl(&pageopaque->control[offnum - 1], key2match);
+		}
+		offnum += kwidth;
+	}
+
+	if(ScanDirectionIsForward(dir))
+	{
+		/* load items[] in ascending order */
+		itemIndex = 0;
+		
+		for(i = 0; i < mindex; i++)
+		{
+			while(mmask[i] != 0)
+			{
+				j = pg_rightmost_one_pos64(mmask[i]);
+				mmask[i] &= (mmask[i] - 1);
+				k = i * kwidth + j;
+				if(k >= maxoff)
+					break;
+				
+				itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, k + 1));
+				if ((so->hashso_buc_populated && !so->hashso_buc_split &&
+					(itup->t_info & INDEX_MOVED_BY_SPLIT_MASK)) ||
+					(scan->ignore_killed_tuples &&
+					(ItemIdIsDead(PageGetItemId(page, k + 1)))))
+					continue;
+				// check hash key again
+				if(so->hashso_sk_hash == _hash_get_indextuple_hashkey(itup) &&
+				_hash_checkqual(scan, itup))
+				{
+					_hash_saveitem(so, itemIndex, k + 1, itup);
+					itemIndex++;
+				}
+			}
+		}
+
+		Assert(itemIndex <= MaxIndexTuplesPerPage);
+		return itemIndex;
+	}
+	else
+	{
+		itemIndex = MaxIndexTuplesPerPage;
+
+		for(int i = mindex - 1; i >= 0; i--)
+		{
+			while(mmask[i] != 0)
+			{
+				j = pg_leftmost_one_pos64(mmask[i]);
+				pg_set_most_significant_bit_to_zero64(&mmask[i]);
+				k = i * kwidth + j;
+				if(k >= maxoff)
+					continue;
+
+				itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, k + 1));
+				if ((so->hashso_buc_populated && !so->hashso_buc_split &&
+					(itup->t_info & INDEX_MOVED_BY_SPLIT_MASK)) ||
+					(scan->ignore_killed_tuples &&
+					(ItemIdIsDead(PageGetItemId(page, k + 1)))))
+					continue;
+				// check hash key again
+				if(so->hashso_sk_hash == _hash_get_indextuple_hashkey(itup) &&
+				_hash_checkqual(scan, itup))
+				{
+					itemIndex--;
+					_hash_saveitem(so, itemIndex, k + 1, itup);
+				}
+			}
+		}
+
+		Assert(itemIndex >= 0);
+		return itemIndex;
+	}
+}
+
+static inline uint64
+_hash_match_ctl(uint8* pctl, char ctl2match)
+{
+	__m512i ctl2matchv = _mm512_set1_epi8(ctl2match);
+	__m512i ctlv = _mm512_loadu_si512(pctl);
+	return _mm512_cmpeq_epi8_mask(ctlv, ctl2matchv);
 }
 
 /* Save an index item into so->currPos.items[itemIndex] */

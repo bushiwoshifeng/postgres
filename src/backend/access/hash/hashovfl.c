@@ -944,6 +944,7 @@ readpage:
 					MarkBufferDirty(wbuf);
 
 					/* Delete tuples we already moved off read page */
+					_hash_multi_delete_ctl(rpage, deletable, ndeletable);
 					PageIndexMultiDelete(rpage, deletable, ndeletable);
 					MarkBufferDirty(rbuf);
 

@@ -268,21 +268,29 @@ restart_insert:
 OffsetNumber
 _hash_pgaddtup(Relation rel, Buffer buf, Size itemsize, IndexTuple itup)
 {
-	OffsetNumber itup_off;
+	OffsetNumber itup_off, limit;
 	Page		page;
 	uint32		hashkey;
+	HashPageOpaque pageopaque;
 
 	_hash_checkpage(rel, buf, LH_BUCKET_PAGE | LH_OVERFLOW_PAGE);
 	page = BufferGetPage(buf);
+	pageopaque = HashPageGetOpaque(page);
+	limit = OffsetNumberNext(PageGetMaxOffsetNumber(page));
 
 	/* Find where to insert the tuple (preserving page's hashkey ordering) */
 	hashkey = _hash_get_indextuple_hashkey(itup);
-	itup_off = _hash_binsearch(page, hashkey);
+	// itup_off = _hash_binsearch(page, hashkey);
+	itup_off = limit;
 
 	if (PageAddItem(page, (Item) itup, itemsize, itup_off, false, false)
 		== InvalidOffsetNumber)
 		elog(ERROR, "failed to add index item to \"%s\"",
 			 RelationGetRelationName(rel));
+	/* add control byte to opaque */
+	if(itup_off < limit)
+		memmove(&pageopaque->control[itup_off], &pageopaque->control[itup_off - 1], limit - itup_off * sizeof(uint8));
+	pageopaque->control[itup_off - 1] = HASHKEY_GETCTL(hashkey);
 
 	return itup_off;
 }
@@ -300,13 +308,16 @@ void
 _hash_pgaddmultitup(Relation rel, Buffer buf, IndexTuple *itups,
 					OffsetNumber *itup_offsets, uint16 nitups)
 {
-	OffsetNumber itup_off;
+	OffsetNumber itup_off, limit;
 	Page		page;
 	uint32		hashkey;
 	int			i;
+	HashPageOpaque pageopaque;
 
 	_hash_checkpage(rel, buf, LH_BUCKET_PAGE | LH_OVERFLOW_PAGE);
 	page = BufferGetPage(buf);
+	pageopaque = HashPageGetOpaque(page);
+	limit = OffsetNumberNext(PageGetMaxOffsetNumber(page));
 
 	for (i = 0; i < nitups; i++)
 	{
@@ -317,7 +328,8 @@ _hash_pgaddmultitup(Relation rel, Buffer buf, IndexTuple *itups,
 
 		/* Find where to insert the tuple (preserving page's hashkey ordering) */
 		hashkey = _hash_get_indextuple_hashkey(itups[i]);
-		itup_off = _hash_binsearch(page, hashkey);
+		// itup_off = _hash_binsearch(page, hashkey);
+		itup_off = limit;
 
 		itup_offsets[i] = itup_off;
 
@@ -325,6 +337,11 @@ _hash_pgaddmultitup(Relation rel, Buffer buf, IndexTuple *itups,
 			== InvalidOffsetNumber)
 			elog(ERROR, "failed to add index item to \"%s\"",
 				 RelationGetRelationName(rel));
+		/* add control byte to opaque */
+		if(itup_off < limit)
+			memmove(&pageopaque->control[itup_off], &pageopaque->control[itup_off - 1], limit - itup_off * sizeof(uint8));
+		pageopaque->control[itup_off - 1] = HASHKEY_GETCTL(hashkey);
+		limit++;
 	}
 }
 
@@ -374,6 +391,7 @@ _hash_vacuum_one_page(Relation rel, Relation hrel, Buffer metabuf, Buffer buf)
 		/* No ereport(ERROR) until changes are logged */
 		START_CRIT_SECTION();
 
+		_hash_multi_delete_ctl(page, deletable, ndeletable);
 		PageIndexMultiDelete(page, deletable, ndeletable);
 
 		/*
