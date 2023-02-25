@@ -377,6 +377,72 @@ _hash_binsearch(Page page, uint32 hash_value)
 	return lower;
 }
 
+/* find offsetnumber whose bit-reverse > than current */
+OffsetNumber
+_hash_binsearch_new(Page page, uint32 hash_value)
+{
+	OffsetNumber upper;
+	OffsetNumber lower;
+	/* convert hash_value to bit-reverse format */
+	hash_value = pg_reverse_bits(hash_value);
+
+	upper = PageGetMaxOffsetNumber(page) + 1;
+	lower = FirstOffsetNumber;
+
+	while (upper > lower)
+	{
+		OffsetNumber off;
+		IndexTuple	itup;
+		uint32		hashkey;
+
+		off = (upper + lower) / 2;
+		Assert(OffsetNumberIsValid(off));
+
+		itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, off));
+		hashkey = _hash_get_indextuple_hashkey(itup);
+		hashkey = pg_reverse_bits(hashkey);	/* compare bit-reverse order */
+		if (hashkey <= hash_value)	/* <= here */
+			lower = off + 1;
+		else
+			upper = off;
+	}
+
+	return lower;
+}
+
+/* find offsetnumber whose bit-reverse >= than current */
+OffsetNumber
+_hash_binsearch_new2(Page page, uint32 hash_value)
+{
+	OffsetNumber upper;
+	OffsetNumber lower;
+	/* convert hash_value to bit-reverse format */
+	hash_value = pg_reverse_bits(hash_value);
+
+	upper = PageGetMaxOffsetNumber(page) + 1;
+	lower = FirstOffsetNumber;
+
+	while (upper > lower)
+	{
+		OffsetNumber off;
+		IndexTuple	itup;
+		uint32		hashkey;
+
+		off = (upper + lower) / 2;
+		Assert(OffsetNumberIsValid(off));
+
+		itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, off));
+		hashkey = _hash_get_indextuple_hashkey(itup);
+		hashkey = pg_reverse_bits(hashkey);	/* compare bit-reverse order */
+		if (hashkey < hash_value)	/* < here */
+			lower = off + 1;
+		else
+			upper = off;
+	}
+
+	return lower;
+}
+
 /*
  * _hash_binsearch_last
  *

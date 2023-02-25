@@ -27,6 +27,7 @@
 #include "storage/lockdefs.h"
 #include "utils/hsearch.h"
 #include "utils/relcache.h"
+#include "port/pg_bitutils.h"
 
 /*
  * Mapping from hash bucket number to physical block number of bucket's
@@ -391,9 +392,14 @@ extern void hashadjustmembers(Oid opfamilyoid,
 
 /* hashinsert.c */
 extern void _hash_doinsert(Relation rel, IndexTuple itup, Relation heapRel);
+extern bool _hash_doinsert_new(Relation rel, IndexTuple itup, Relation heapRel);
 extern OffsetNumber _hash_pgaddtup(Relation rel, Buffer buf,
 								   Size itemsize, IndexTuple itup);
+extern OffsetNumber _hash_pgaddtup_new(Relation rel, Buffer buf,
+								   Size itemsize, IndexTuple itup);
 extern void _hash_pgaddmultitup(Relation rel, Buffer buf, IndexTuple *itups,
+								OffsetNumber *itup_offsets, uint16 nitups);
+extern void _hash_pgaddmultitup_new(Relation rel, Buffer buf, IndexTuple *itups,
 								OffsetNumber *itup_offsets, uint16 nitups);
 
 /* hashovfl.c */
@@ -434,7 +440,7 @@ extern uint32 _hash_init(Relation rel, double num_tuples,
 extern void _hash_init_metabuffer(Buffer buf, double num_tuples,
 								  RegProcedure procid, uint16 ffactor, bool initpage);
 extern void _hash_pageinit(Page page, Size size);
-extern void _hash_expandtable(Relation rel, Buffer metabuf);
+extern bool _hash_expandtable(Relation rel, Buffer metabuf);
 extern void _hash_finish_split(Relation rel, Buffer metabuf, Buffer obuf,
 							   Bucket obucket, uint32 maxbucket, uint32 highmask,
 							   uint32 lowmask);
@@ -442,6 +448,7 @@ extern void _hash_finish_split(Relation rel, Buffer metabuf, Buffer obuf,
 /* hashsearch.c */
 extern bool _hash_next(IndexScanDesc scan, ScanDirection dir);
 extern bool _hash_first(IndexScanDesc scan, ScanDirection dir);
+extern bool _hash_first_new(IndexScanDesc scan, ScanDirection dir);
 
 /* hashsort.c */
 typedef struct HSpool HSpool;	/* opaque struct in hashsort.c */
@@ -466,6 +473,8 @@ extern bool _hash_convert_tuple(Relation index,
 								Datum *user_values, bool *user_isnull,
 								Datum *index_values, bool *index_isnull);
 extern OffsetNumber _hash_binsearch(Page page, uint32 hash_value);
+extern OffsetNumber _hash_binsearch_new(Page page, uint32 hash_value);
+extern OffsetNumber _hash_binsearch_new2(Page page, uint32 hash_value);
 extern OffsetNumber _hash_binsearch_last(Page page, uint32 hash_value);
 extern BlockNumber _hash_get_oldblock_from_newbucket(Relation rel, Bucket new_bucket);
 extern BlockNumber _hash_get_newblock_from_oldbucket(Relation rel, Bucket old_bucket);
