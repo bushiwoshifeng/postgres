@@ -33,6 +33,7 @@
 #include "access/xloginsert.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
+#include "portability/instr_time.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "storage/smgr.h"
@@ -46,6 +47,16 @@ static void _hash_splitbucket(Relation rel, Buffer metabuf,
 							  HTAB *htab,
 							  uint32 maxbucket,
 							  uint32 highmask, uint32 lowmask);
+static void _hash_splitbucket_new(Relation rel,
+								BlockNumber nblkno,
+				  			Bucket obucket,
+				  			Bucket nbucket,
+				  			Buffer obuf,
+				  			Buffer nbuf,
+				  			HTAB *htab,
+				  			uint32 maxbucket,
+				  			uint32 highmask,
+				  			uint32 lowmask);
 static void log_split_page(Relation rel, Buffer buf);
 
 
@@ -610,7 +621,7 @@ _hash_pageinit(Page page, Size size)
  * The caller must hold a pin, but no lock, on the metapage buffer.
  * The buffer is returned in the same state.
  */
-void
+bool
 _hash_expandtable(Relation rel, Buffer metabuf)
 {
 	HashMetaPage metap;
@@ -630,6 +641,7 @@ _hash_expandtable(Relation rel, Buffer metabuf)
 	uint32		lowmask;
 	bool		metap_update_masks = false;
 	bool		metap_update_splitpoint = false;
+	bool ret = false;
 
 restart_expand:
 
@@ -945,22 +957,22 @@ restart_expand:
 	LockBuffer(metabuf, BUFFER_LOCK_UNLOCK);
 
 	/* Relocate records to the new bucket */
-	_hash_splitbucket(rel, metabuf,
+	_hash_splitbucket_new(rel, start_nblkno,
 					  old_bucket, new_bucket,
 					  buf_oblkno, buf_nblkno, NULL,
 					  maxbucket, highmask, lowmask);
-
 	/* all done, now release the pins on primary buckets. */
 	_hash_dropbuf(rel, buf_oblkno);
 	_hash_dropbuf(rel, buf_nblkno);
 
-	return;
+	return ret;
 
 	/* Here if decide not to split or fail to acquire old bucket lock */
 fail:
 
 	/* We didn't write the metapage, so just drop lock */
 	LockBuffer(metabuf, BUFFER_LOCK_UNLOCK);
+	return ret;
 }
 
 
@@ -1340,6 +1352,243 @@ _hash_splitbucket(Relation rel,
 	}
 }
 
+static void
+_hash_splitbucket_new(Relation rel,
+					BlockNumber nblkno,
+				  Bucket obucket,
+				  Bucket nbucket,
+				  Buffer obuf,
+				  Buffer nbuf,
+				  HTAB *htab,
+				  uint32 maxbucket,
+				  uint32 highmask,
+				  uint32 lowmask)
+{
+	Buffer		bucket_obuf;
+	Buffer		bucket_nbuf;
+	Page		opage;
+	Page		npage;
+	HashPageOpaque oopaque;
+	HashPageOpaque nopaque;
+	OffsetNumber itup_offsets[MaxIndexTuplesPerPage];
+	IndexTuple	itups[MaxIndexTuplesPerPage];
+	Size		all_tups_size = 0;
+	int			i;
+	uint16		nitups = 0;
+	BlockNumber oblkno;
+
+	bucket_obuf = obuf;
+	opage = BufferGetPage(obuf);
+	oopaque = HashPageGetOpaque(opage);
+
+	bucket_nbuf = nbuf;
+	npage = BufferGetPage(nbuf);
+	nopaque = HashPageGetOpaque(npage);
+
+	/* Copy the predicate locks from old bucket to new bucket. */
+	PredicateLockPageSplit(rel,
+						   BufferGetBlockNumber(bucket_obuf),
+						   BufferGetBlockNumber(bucket_nbuf));
+
+	/* compute boundary hash value */
+	uint32 bound_hashkey = obucket | (~highmask);
+	OffsetNumber bound_off, omaxoff;
+	while(true){
+		omaxoff = PageGetMaxOffsetNumber(opage);
+		bound_off = _hash_binsearch_new(opage, bound_hashkey);
+		if(bound_off <= omaxoff){
+				break;
+		}else{
+			oblkno = oopaque->hasho_nextblkno;
+			if(!BlockNumberIsValid(oblkno))
+				break;
+			/* retain the pin on the old primary bucket */
+			if (obuf == bucket_obuf)
+				LockBuffer(obuf, BUFFER_LOCK_UNLOCK);
+			else
+				_hash_relbuf(rel, obuf);
+			
+			obuf = _hash_getbuf(rel, oblkno, HASH_WRITE, LH_OVERFLOW_PAGE);
+			opage = BufferGetPage(obuf);
+			oopaque = HashPageGetOpaque(opage);
+		}
+	}
+	/* find tuples to move */
+	if(bound_off <= omaxoff){
+		OffsetNumber ooffnum;
+		for(ooffnum = bound_off; ooffnum <= omaxoff; ooffnum =  OffsetNumberNext(ooffnum))
+		{
+			bool found=false;
+			if(ItemIdIsDead(PageGetItemId(opage, ooffnum)))
+				continue;
+			IndexTuple itup=PageGetItem(opage, PageGetItemId(opage, ooffnum));
+			
+			if (htab)
+				(void) hash_search(htab, &itup->t_tid, HASH_FIND, &found);
+			if(found)
+				continue;
+			
+			IndexTuple new_itup = CopyIndexTuple(itup);
+			/* we do not need this mask
+			new_itup->t_info |= INDEX_MOVED_BY_SPLIT_MASK; */
+			all_tups_size += MAXALIGN(IndexTupleSize(new_itup));
+			itups[nitups++] = new_itup;
+		}
+		Assert(PageGetFreeSpaceForMultipleTuples(npage, nitups) >= all_tups_size);
+		/* insert to new bucket's primary page */
+		
+		oblkno = oopaque->hasho_nextblkno;
+		
+		START_CRIT_SECTION();
+
+		_hash_pgaddmultitup_new(rel, nbuf, itups, itup_offsets, nitups);
+		if(BlockNumberIsValid(oblkno))
+			nopaque->hasho_nextblkno = oblkno;
+		MarkBufferDirty(nbuf);
+		/* log the split operation before releasing the lock */
+		log_split_page(rel, nbuf);
+		/* link page after obuf behind nbuf */
+		oopaque->hasho_nextblkno = InvalidBlockNumber;
+		MarkBufferDirty(obuf);
+		
+		END_CRIT_SECTION();
+
+		if (obuf == bucket_obuf)
+				LockBuffer(obuf, BUFFER_LOCK_UNLOCK);
+		else
+			_hash_relbuf(rel, obuf);
+
+		Assert(nbuf == bucket_nbuf);
+		LockBuffer(nbuf, BUFFER_LOCK_UNLOCK);
+		
+		if(BlockNumberIsValid(oblkno)){
+			obuf = _hash_getbuf(rel, oblkno, HASH_WRITE, LH_OVERFLOW_PAGE);
+			opage = BufferGetPage(obuf);
+			oopaque = HashPageGetOpaque(opage);
+			
+			START_CRIT_SECTION();
+			
+			oopaque->hasho_prevblkno = nblkno;
+			oopaque->hasho_bucket = nbucket;
+			MarkBufferDirty(obuf);
+			
+			END_CRIT_SECTION();
+			
+			oblkno = oopaque->hasho_nextblkno;
+			_hash_relbuf(rel, obuf);
+			while(BlockNumberIsValid(oblkno)){
+				obuf = _hash_getbuf(rel, oblkno, HASH_WRITE, LH_OVERFLOW_PAGE);
+				opage = BufferGetPage(obuf);
+				oopaque = HashPageGetOpaque(opage);
+				
+				START_CRIT_SECTION();
+				
+				oopaque->hasho_bucket = nbucket;
+				MarkBufferDirty(obuf);
+				
+				END_CRIT_SECTION();
+				
+				oblkno = oopaque->hasho_nextblkno;
+				_hash_relbuf(rel, obuf);
+			}
+		}
+		/* be tidy */
+		for (i = 0; i < nitups; i++)
+			pfree(itups[i]);
+		nitups = 0;
+		all_tups_size = 0;
+	}else{
+		/* no tuples to move, just release locks */
+		if(obuf == bucket_obuf)
+			LockBuffer(obuf, BUFFER_LOCK_UNLOCK);
+		else
+			_hash_relbuf(rel, obuf);
+		
+		Assert(nbuf == bucket_nbuf);
+		LockBuffer(nbuf, BUFFER_LOCK_UNLOCK);
+	}
+	/*
+	 * We're at the end of the old bucket chain, so we're done partitioning
+	 * the tuples.  Mark the old and new buckets to indicate split is
+	 * finished.
+	 *
+	 * To avoid deadlocks due to locking order of buckets, first lock the old
+	 * bucket and then the new bucket.
+	 */
+	LockBuffer(bucket_obuf, BUFFER_LOCK_EXCLUSIVE);
+	opage = BufferGetPage(bucket_obuf);
+	oopaque = HashPageGetOpaque(opage);
+
+	LockBuffer(bucket_nbuf, BUFFER_LOCK_EXCLUSIVE);
+	npage = BufferGetPage(bucket_nbuf);
+	nopaque = HashPageGetOpaque(npage);
+
+	START_CRIT_SECTION();
+
+	oopaque->hasho_flag &= ~LH_BUCKET_BEING_SPLIT;
+	nopaque->hasho_flag &= ~LH_BUCKET_BEING_POPULATED;
+
+	/*
+	 * After the split is finished, mark the old bucket to indicate that it
+	 * contains deletable tuples.  We will clear split-cleanup flag after
+	 * deleting such tuples either at the end of split or at the next split
+	 * from old bucket or at the time of vacuum.
+	 */
+	oopaque->hasho_flag |= LH_BUCKET_NEEDS_SPLIT_CLEANUP;
+
+	/*
+	 * now write the buffers, here we don't release the locks as caller is
+	 * responsible to release locks.
+	 */
+	MarkBufferDirty(bucket_obuf);
+	MarkBufferDirty(bucket_nbuf);
+
+	if (RelationNeedsWAL(rel))
+	{
+		XLogRecPtr	recptr;
+		xl_hash_split_complete xlrec;
+
+		xlrec.old_bucket_flag = oopaque->hasho_flag;
+		xlrec.new_bucket_flag = nopaque->hasho_flag;
+
+		XLogBeginInsert();
+
+		XLogRegisterData((char *) &xlrec, SizeOfHashSplitComplete);
+
+		XLogRegisterBuffer(0, bucket_obuf, REGBUF_STANDARD);
+		XLogRegisterBuffer(1, bucket_nbuf, REGBUF_STANDARD);
+
+		recptr = XLogInsert(RM_HASH_ID, XLOG_HASH_SPLIT_COMPLETE);
+
+		PageSetLSN(BufferGetPage(bucket_obuf), recptr);
+		PageSetLSN(BufferGetPage(bucket_nbuf), recptr);
+	}
+
+	END_CRIT_SECTION();
+
+	/*
+	 * If possible, clean up the old bucket.  We might not be able to do this
+	 * if someone else has a pin on it, but if not then we can go ahead.  This
+	 * isn't absolutely necessary, but it reduces bloat; if we don't do it
+	 * now, VACUUM will do it eventually, but maybe not until new overflow
+	 * pages have been allocated.  Note that there's no need to clean up the
+	 * new bucket.
+	 */
+	if (IsBufferCleanupOK(bucket_obuf))
+	{
+		LockBuffer(bucket_nbuf, BUFFER_LOCK_UNLOCK);
+		hashbucketcleanup(rel, obucket, bucket_obuf,
+						  BufferGetBlockNumber(bucket_obuf), NULL,
+						  maxbucket, highmask, lowmask, NULL, NULL, true,
+						  NULL, NULL);
+	}
+	else
+	{
+		LockBuffer(bucket_nbuf, BUFFER_LOCK_UNLOCK);
+		LockBuffer(bucket_obuf, BUFFER_LOCK_UNLOCK);
+	}
+}
+
 /*
  *	_hash_finish_split() -- Finish the previously interrupted split operation
  *
@@ -1356,6 +1605,8 @@ void
 _hash_finish_split(Relation rel, Buffer metabuf, Buffer obuf, Bucket obucket,
 				   uint32 maxbucket, uint32 highmask, uint32 lowmask)
 {
+	/* we wanna disable finish_split temporaily */
+	Assert(false);
 	HASHCTL		hash_ctl;
 	HTAB	   *tidhtab;
 	Buffer		bucket_nbuf = InvalidBuffer;
@@ -1453,7 +1704,7 @@ _hash_finish_split(Relation rel, Buffer metabuf, Buffer obuf, Bucket obucket,
 	npageopaque = HashPageGetOpaque(npage);
 	nbucket = npageopaque->hasho_bucket;
 
-	_hash_splitbucket(rel, metabuf, obucket,
+	_hash_splitbucket_new(rel, bucket_nblkno, obucket,
 					  nbucket, obuf, bucket_nbuf, tidhtab,
 					  maxbucket, highmask, lowmask);
 

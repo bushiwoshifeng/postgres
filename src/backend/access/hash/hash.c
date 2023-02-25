@@ -29,6 +29,7 @@
 #include "miscadmin.h"
 #include "optimizer/plancat.h"
 #include "pgstat.h"
+#include "portability/instr_time.h"
 #include "utils/builtins.h"
 #include "utils/index_selfuncs.h"
 #include "utils/rel.h"
@@ -231,7 +232,7 @@ hashbuildCallback(Relation index,
 		itup = index_form_tuple(RelationGetDescr(index),
 								index_values, index_isnull);
 		itup->t_tid = *tid;
-		_hash_doinsert(index, itup, buildstate->heapRel);
+		_hash_doinsert_new(index, itup, buildstate->heapRel);
 		pfree(itup);
 	}
 
@@ -265,7 +266,7 @@ hashinsert(Relation rel, Datum *values, bool *isnull,
 	itup = index_form_tuple(RelationGetDescr(rel), index_values, index_isnull);
 	itup->t_tid = *ht_ctid;
 
-	_hash_doinsert(rel, itup, heapRel);
+	bool ret = _hash_doinsert_new(rel, itup, heapRel);
 
 	pfree(itup);
 
@@ -291,7 +292,7 @@ hashgettuple(IndexScanDesc scan, ScanDirection dir)
 	 * get the first item in the scan.
 	 */
 	if (!HashScanPosIsValid(so->currPos))
-		res = _hash_first(scan, dir);
+		res = _hash_first_new(scan, dir);
 	else
 	{
 		/*
@@ -336,7 +337,7 @@ hashgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	int64		ntids = 0;
 	HashScanPosItem *currItem;
 
-	res = _hash_first(scan, ForwardScanDirection);
+	res = _hash_first_new(scan, ForwardScanDirection);
 
 	while (res)
 	{
@@ -910,8 +911,9 @@ hashbucketcleanup(Relation rel, Bucket cur_bucket, Buffer bucket_buf,
 	 * If we have deleted anything, try to compact free space.  For squeezing
 	 * the bucket, we must have a cleanup lock, else it can impact the
 	 * ordering of tuples for a scan that has started before it.
-	 */
-	if (bucket_dirty && IsBufferCleanupOK(bucket_buf))
+	 * TODO: fix squeezebucket and enable it, disable it here
+ 	 */
+	if (false && bucket_dirty && IsBufferCleanupOK(bucket_buf))
 		_hash_squeezebucket(rel, cur_bucket, bucket_blkno, bucket_buf,
 							bstrategy);
 	else

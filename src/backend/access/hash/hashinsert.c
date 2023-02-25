@@ -26,6 +26,8 @@
 
 static void _hash_vacuum_one_page(Relation rel, Relation hrel,
 								  Buffer metabuf, Buffer buf);
+static void _hash_pageinsert(Relation rel, Buffer metabuf, Buffer buf, 
+									Size itemsz, IndexTuple itup);
 
 /*
  *	_hash_doinsert() -- Handle insertion of a single index tuple.
@@ -254,6 +256,299 @@ restart_insert:
 	_hash_dropbuf(rel, metabuf);
 }
 
+bool
+_hash_doinsert_new(Relation rel, IndexTuple itup, Relation heapRel)
+{
+	Buffer		buf = InvalidBuffer;
+	Buffer		bucket_buf;
+	Buffer		metabuf;
+	HashMetaPage metap;
+	HashMetaPage usedmetap = NULL;
+	Page		metapage;
+	Page		page;
+	HashPageOpaque pageopaque;
+	Size		itemsz;
+	bool		do_expand;
+	uint32		hashkey, reverse_key;
+	Bucket		bucket;
+	OffsetNumber itup_off, maxoff;
+	bool ret = false;
+
+	/*
+	 * Get the hash key for the item (it's stored in the index tuple itself).
+	 */
+	hashkey = _hash_get_indextuple_hashkey(itup);
+	reverse_key = pg_reverse_bits(hashkey);
+
+	/* compute item size too */
+	itemsz = IndexTupleSize(itup);
+	itemsz = MAXALIGN(itemsz);	/* be safe, PageAddItem will do this but we
+								 * need to be consistent */
+
+restart_insert:
+
+	/*
+	 * Read the metapage.  We don't lock it yet; HashMaxItemSize() will
+	 * examine pd_pagesize_version, but that can't change so we can examine it
+	 * without a lock.
+	 */
+	metabuf = _hash_getbuf(rel, HASH_METAPAGE, HASH_NOLOCK, LH_META_PAGE);
+	metapage = BufferGetPage(metabuf);
+
+	/*
+	 * Check whether the item can fit on a hash page at all. (Eventually, we
+	 * ought to try to apply TOAST methods if not.)  Note that at this point,
+	 * itemsz doesn't include the ItemId.
+	 *
+	 * XXX this is useless code if we are only storing hash keys.
+	 */
+	if (itemsz > HashMaxItemSize(metapage))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("index row size %zu exceeds hash maximum %zu",
+						itemsz, HashMaxItemSize(metapage)),
+				 errhint("Values larger than a buffer page cannot be indexed.")));
+
+	/* Lock the primary bucket page for the target bucket. */
+	buf = _hash_getbucketbuf_from_hashkey(rel, hashkey, HASH_WRITE,
+										  &usedmetap);
+	Assert(usedmetap != NULL);
+
+	CheckForSerializableConflictIn(rel, NULL, BufferGetBlockNumber(buf));
+
+	/* remember the primary bucket buffer to release the pin on it at end. */
+	bucket_buf = buf;
+
+	page = BufferGetPage(buf);
+	pageopaque = HashPageGetOpaque(page);
+	bucket = pageopaque->hasho_bucket;
+
+	/*
+	 * If this bucket is in the process of being split, try to finish the
+	 * split before inserting, because that might create room for the
+	 * insertion to proceed without allocating an additional overflow page.
+	 * It's only interesting to finish the split if we're trying to insert
+	 * into the bucket from which we're removing tuples (the "old" bucket),
+	 * not if we're trying to insert into the bucket into which tuples are
+	 * being moved (the "new" bucket).
+	 */
+	if (H_BUCKET_BEING_SPLIT(pageopaque) && IsBufferCleanupOK(buf))
+	{
+		/* release the lock on bucket buffer, before completing the split. */
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
+		_hash_finish_split(rel, metabuf, buf, bucket,
+						   usedmetap->hashm_maxbucket,
+						   usedmetap->hashm_highmask,
+						   usedmetap->hashm_lowmask);
+
+		/* release the pin on old and meta buffer.  retry for insert. */
+		_hash_dropbuf(rel, buf);
+		_hash_dropbuf(rel, metabuf);
+		goto restart_insert;
+	}
+
+	/* SPECIAL HERE */
+	if(H_BUCKET_BEING_POPULATED(pageopaque)){
+		/* should also help finish split, but we don't do that temporarily */
+		_hash_relbuf(rel, buf);
+		_hash_dropbuf(rel, metabuf);
+		goto restart_insert;
+	}
+
+	/* Do the insertion */
+	while (true)
+	{
+		maxoff = PageGetMaxOffsetNumber(page);
+		BlockNumber nextblkno = pageopaque->hasho_nextblkno;
+		if (maxoff == 0)
+		{
+			if (BlockNumberIsValid(nextblkno))
+			{
+				/* goto next page */
+			}
+			else
+			{
+				/* last page is empty, we should insert here */
+				break;
+			}
+		}
+		else
+		{
+			IndexTuple last_itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, maxoff));
+			uint32 itup_hash_key = _hash_get_indextuple_hashkey(last_itup);
+			uint32 itup_reverse_key = pg_reverse_bits(itup_hash_key);
+			if(itup_reverse_key > reverse_key){
+				if(PageGetFreeSpace(page) >= itemsz){
+					break;
+				}
+				/* move tuples to make room for insertion */
+				while(PageGetFreeSpace(page) < itemsz){
+					Buffer nbuf;
+					OffsetNumber nmaxoff = PageGetMaxOffsetNumber(page);
+					IndexTuple itup2move = (IndexTuple) PageGetItem(page, PageGetItemId(page, nmaxoff));
+					Size nitemsz = MAXALIGN(IndexTupleSize(itup2move));
+					if(!BlockNumberIsValid(nextblkno)){
+						LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+						nbuf = _hash_addovflpage(rel, metabuf, buf, true);
+						_hash_relbuf(rel, nbuf);
+						LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+						nextblkno = pageopaque->hasho_nextblkno;
+						Assert(BlockNumberIsValid(nextblkno));
+						nbuf = _hash_getbuf(rel, nextblkno, HASH_WRITE, LH_OVERFLOW_PAGE);
+					}else{
+						nbuf = _hash_getbuf(rel, nextblkno, HASH_WRITE, LH_OVERFLOW_PAGE);
+					}
+					_hash_pageinsert(rel, metabuf, nbuf, nitemsz, itup2move);
+					/* remove last tuple, MarkBufferDirty() will be called later */
+					PageIndexTupleDelete(page, nmaxoff);
+				}
+				break;
+			}else if(!BlockNumberIsValid(nextblkno)){
+				if(PageGetFreeSpace(page) < itemsz){
+					/* should allocate new of page */
+					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+					/* cause we want to get nextblkno of buf, we must retain a pin here */
+					Buffer nbuf = _hash_addovflpage(rel, metabuf, buf, true);
+					/* cause we retain a pin on buf, tuples can not be removed
+					 * just insert to subsequent pages 
+					 */
+					/* release lock on new of page and goto next page */
+					_hash_relbuf(rel, nbuf);
+					LockBuffer(buf, BUFFER_LOCK_SHARE);
+					nextblkno = pageopaque->hasho_nextblkno;
+					Assert(BlockNumberIsValid(nextblkno));
+				}else{
+					/* no greater reverse key, we should insert here */
+					break;
+				}
+			}else{
+				/* goto next page */
+			}
+		}
+		/* goto next page */
+		if (buf != bucket_buf)
+			_hash_relbuf(rel, buf);
+		else
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		
+		buf = _hash_getbuf(rel, nextblkno, HASH_WRITE, LH_OVERFLOW_PAGE);
+		page = BufferGetPage(buf);
+		pageopaque = HashPageGetOpaque(page);
+		Assert((pageopaque->hasho_flag & LH_PAGE_TYPE) == LH_OVERFLOW_PAGE);
+		Assert(pageopaque->hasho_bucket == bucket);
+	}
+	
+	/*
+	 * Write-lock the metapage so we can increment the tuple count. After
+	 * incrementing it, check to see if it's time for a split.
+	 */
+	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+
+	/* Do the update.  No ereport(ERROR) until changes are logged */
+	START_CRIT_SECTION();
+
+	/* found page with enough space, so add the item here */
+	itup_off = _hash_pgaddtup_new(rel, buf, itemsz, itup);
+	MarkBufferDirty(buf);
+
+	/* metapage operations */
+	metap = HashPageGetMeta(metapage);
+	metap->hashm_ntuples += 1;
+
+	/* Make sure this stays in sync with _hash_expandtable() */
+	do_expand = metap->hashm_ntuples >
+		(double) metap->hashm_ffactor * (metap->hashm_maxbucket + 1);
+
+	MarkBufferDirty(metabuf);
+
+	/* XLOG stuff */
+	if (RelationNeedsWAL(rel))
+	{
+		xl_hash_insert xlrec;
+		XLogRecPtr	recptr;
+
+		xlrec.offnum = itup_off;
+
+		XLogBeginInsert();
+		XLogRegisterData((char *) &xlrec, SizeOfHashInsert);
+
+		XLogRegisterBuffer(1, metabuf, REGBUF_STANDARD);
+
+		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
+		XLogRegisterBufData(0, (char *) itup, IndexTupleSize(itup));
+
+		recptr = XLogInsert(RM_HASH_ID, XLOG_HASH_INSERT);
+
+		PageSetLSN(BufferGetPage(buf), recptr);
+		PageSetLSN(BufferGetPage(metabuf), recptr);
+	}
+
+	END_CRIT_SECTION();
+
+	/* drop lock on metapage, but keep pin */
+	LockBuffer(metabuf, BUFFER_LOCK_UNLOCK);
+
+	/*
+	 * Release the modified page and ensure to release the pin on primary
+	 * page.
+	 */
+	_hash_relbuf(rel, buf);
+	if (buf != bucket_buf)
+		_hash_dropbuf(rel, bucket_buf);
+
+	/* Attempt to split if a split is needed */
+	if (do_expand){
+		ret = _hash_expandtable(rel, metabuf);
+	}
+	/* Finally drop our pin on the metapage */
+	_hash_dropbuf(rel, metabuf);
+	
+	return ret;
+}
+
+/*
+ * insert itup to buf, buf is locked and pinned
+ * if overflow, move last tuple to next page recursively
+ */
+static void
+_hash_pageinsert(Relation rel, Buffer metabuf, Buffer buf, Size itemsz, IndexTuple itup)
+{
+	Page page;
+	HashPageOpaque pageopaque;
+	OffsetNumber maxoff;
+	BlockNumber nextblkno;
+	Buffer nbuf;
+
+
+	page = BufferGetPage(buf);
+	pageopaque = HashPageGetOpaque(page);
+	while(PageGetFreeSpace(page) < itemsz){
+		maxoff=PageGetMaxOffsetNumber(page);
+		IndexTuple itup2move = (IndexTuple) PageGetItem(page, PageGetItemId(page, maxoff));
+		Size nitemsz = MAXALIGN(IndexTupleSize(itup2move));
+		nextblkno = pageopaque->hasho_nextblkno;
+		if(!BlockNumberIsValid(nextblkno)){
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			nbuf = _hash_addovflpage(rel, metabuf, buf, true);
+			_hash_relbuf(rel, nbuf);
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			nextblkno = pageopaque->hasho_nextblkno;
+			Assert(BlockNumberIsValid(nextblkno));
+		}
+		nbuf = _hash_getbuf(rel, nextblkno, HASH_WRITE, LH_OVERFLOW_PAGE);
+		_hash_pageinsert(rel, metabuf, nbuf, nitemsz, itup2move);
+		/* remove last tuple */
+		PageIndexTupleDelete(page, maxoff);
+	}
+	/* do the insertion */
+	_hash_pgaddtup_new(rel, buf, itemsz, itup);
+	MarkBufferDirty(buf);	
+	/* xlog stuff... */
+	/* release buf */
+	_hash_relbuf(rel, buf);
+}
+
 /*
  *	_hash_pgaddtup() -- add a tuple to a particular page in the index.
  *
@@ -278,6 +573,34 @@ _hash_pgaddtup(Relation rel, Buffer buf, Size itemsize, IndexTuple itup)
 	/* Find where to insert the tuple (preserving page's hashkey ordering) */
 	hashkey = _hash_get_indextuple_hashkey(itup);
 	itup_off = _hash_binsearch(page, hashkey);
+
+	if (PageAddItem(page, (Item) itup, itemsize, itup_off, false, false)
+		== InvalidOffsetNumber)
+		elog(ERROR, "failed to add index item to \"%s\"",
+			 RelationGetRelationName(rel));
+
+	return itup_off;
+}
+
+/**
+ * same with above function
+ * 
+ * This function should preserve the order of index tuples in specific page
+ * tuples should be sorted in reverse-bit order
+ * when insert, we should search for first tuple whose reverse-bit greater than this tuple and add before it.
+ */
+OffsetNumber
+_hash_pgaddtup_new(Relation rel, Buffer buf, Size itemsize, IndexTuple itup)
+{
+	OffsetNumber itup_off;
+	Page		page;
+	uint32		hashkey;
+
+	_hash_checkpage(rel, buf, LH_BUCKET_PAGE | LH_OVERFLOW_PAGE);
+	page = BufferGetPage(buf);
+	
+	hashkey = _hash_get_indextuple_hashkey(itup);
+	itup_off = _hash_binsearch_new(page, hashkey);
 
 	if (PageAddItem(page, (Item) itup, itemsize, itup_off, false, false)
 		== InvalidOffsetNumber)
@@ -318,6 +641,38 @@ _hash_pgaddmultitup(Relation rel, Buffer buf, IndexTuple *itups,
 		/* Find where to insert the tuple (preserving page's hashkey ordering) */
 		hashkey = _hash_get_indextuple_hashkey(itups[i]);
 		itup_off = _hash_binsearch(page, hashkey);
+
+		itup_offsets[i] = itup_off;
+
+		if (PageAddItem(page, (Item) itups[i], itemsize, itup_off, false, false)
+			== InvalidOffsetNumber)
+			elog(ERROR, "failed to add index item to \"%s\"",
+				 RelationGetRelationName(rel));
+	}
+}
+
+void
+_hash_pgaddmultitup_new(Relation rel, Buffer buf, IndexTuple *itups,
+								OffsetNumber *itup_offsets, uint16 nitups)
+{
+	OffsetNumber itup_off;
+	Page		page;
+	uint32		hashkey;
+	int			i;
+
+	_hash_checkpage(rel, buf, LH_BUCKET_PAGE | LH_OVERFLOW_PAGE);
+	page = BufferGetPage(buf);
+
+	for (i = 0; i < nitups; i++)
+	{
+		Size		itemsize;
+
+		itemsize = IndexTupleSize(itups[i]);
+		itemsize = MAXALIGN(itemsize);
+
+		/* Find where to insert the tuple (preserving page's hashkey ordering) */
+		hashkey = _hash_get_indextuple_hashkey(itups[i]);
+		itup_off = _hash_binsearch_new(page, hashkey);
 
 		itup_offsets[i] = itup_off;
 

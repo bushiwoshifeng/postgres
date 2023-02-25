@@ -144,7 +144,7 @@ _h_indexbuild(HSpool *hspool, Relation heapRel)
 		Assert(hashkey >= lasthashkey);
 #endif
 
-		_hash_doinsert(hspool->index, itup, heapRel);
+		_hash_doinsert_new(hspool->index, itup, heapRel);
 
 		pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
 									 ++tups_done);

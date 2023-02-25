@@ -23,6 +23,8 @@
 
 static bool _hash_readpage(IndexScanDesc scan, Buffer *bufP,
 						   ScanDirection dir);
+static bool _hash_readpage_new(IndexScanDesc scan, Buffer *bufP,
+						   ScanDirection dir);
 static int	_hash_load_qualified_items(IndexScanDesc scan, Page page,
 									   OffsetNumber offnum, ScanDirection dir);
 static inline void _hash_saveitem(HashScanOpaque so, int itemIndex,
@@ -72,7 +74,7 @@ _hash_next(IndexScanDesc scan, ScanDirection dir)
 			{
 				buf = _hash_getbuf(rel, blkno, HASH_READ, LH_OVERFLOW_PAGE);
 				TestForOldSnapshot(scan->xs_snapshot, rel, BufferGetPage(buf));
-				if (!_hash_readpage(scan, &buf, dir))
+				if (!_hash_readpage_new(scan, &buf, dir))
 					end_of_scan = true;
 			}
 			else
@@ -438,13 +440,101 @@ _hash_first(IndexScanDesc scan, ScanDirection dir)
 	return true;
 }
 
+bool
+_hash_first_new(IndexScanDesc scan, ScanDirection dir)
+{
+	Relation	rel = scan->indexRelation;
+	HashScanOpaque so = (HashScanOpaque) scan->opaque;
+	ScanKey		cur;
+	uint32		hashkey;
+	Bucket		bucket;
+	Buffer		buf;
+	Page		page;
+	HashPageOpaque opaque;
+	HashScanPosItem *currItem;
+
+	pgstat_count_index_scan(rel);
+
+	/*
+	 * We do not support hash scans with no index qualification, because we
+	 * would have to read the whole index rather than just one bucket. That
+	 * creates a whole raft of problems, since we haven't got a practical way
+	 * to lock all the buckets against splits or compactions.
+	 */
+	if (scan->numberOfKeys < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("hash indexes do not support whole-index scans")));
+
+	/* There may be more than one index qual, but we hash only the first */
+	cur = &scan->keyData[0];
+
+	/* We support only single-column hash indexes */
+	Assert(cur->sk_attno == 1);
+	/* And there's only one operator strategy, too */
+	Assert(cur->sk_strategy == HTEqualStrategyNumber);
+
+	/*
+	 * If the constant in the index qual is NULL, assume it cannot match any
+	 * items in the index.
+	 */
+	if (cur->sk_flags & SK_ISNULL)
+		return false;
+
+	/*
+	 * Okay to compute the hash key.  We want to do this before acquiring any
+	 * locks, in case a user-defined hash function happens to be slow.
+	 *
+	 * If scankey operator is not a cross-type comparison, we can use the
+	 * cached hash function; otherwise gotta look it up in the catalogs.
+	 *
+	 * We support the convention that sk_subtype == InvalidOid means the
+	 * opclass input type; this is a hack to simplify life for ScanKeyInit().
+	 */
+	if (cur->sk_subtype == rel->rd_opcintype[0] ||
+		cur->sk_subtype == InvalidOid)
+		hashkey = _hash_datum2hashkey(rel, cur->sk_argument);
+	else
+		hashkey = _hash_datum2hashkey_type(rel, cur->sk_argument,
+										   cur->sk_subtype);
+
+	so->hashso_sk_hash = hashkey;
+
+	buf = _hash_getbucketbuf_from_hashkey(rel, hashkey, HASH_READ, NULL);
+	PredicateLockPage(rel, BufferGetBlockNumber(buf), scan->xs_snapshot);
+	page = BufferGetPage(buf);
+	TestForOldSnapshot(scan->xs_snapshot, rel, page);
+	opaque = HashPageGetOpaque(page);
+	bucket = opaque->hasho_bucket;
+
+	so->hashso_bucket_buf = buf;
+
+	/* DO NOT support BACKWARD SCAN */
+	Assert(ScanDirectionIsForward(dir));
+	
+	/* remember which buffer we have pinned, if any */
+	Assert(BufferIsInvalid(so->currPos.buf));
+	so->currPos.buf = buf;
+	
+	/* Now find all the tuples satisfying the qualification from a page */
+	if (!_hash_readpage_new(scan, &buf, dir))
+		return false;
+
+	/* OK, itemIndex says what to return */
+	currItem = &so->currPos.items[so->currPos.itemIndex];
+	scan->xs_heaptid = currItem->heapTid;
+
+	/* if we're here, _hash_readpage found a valid tuples */
+	return true;
+}
+
 /*
  *	_hash_readpage() -- Load data from current index page into so->currPos
  *
  *	We scan all the items in the current index page and save them into
  *	so->currPos if it satisfies the qualification. If no matching items
  *	are found in the current page, we move to the next or previous page
- *	in a bucket chain as indicated by the direction.
+ *	in a bucket chain as indicatedb y the direction.
  *
  *	Return true if any matching items are found else return false.
  */
@@ -596,6 +686,94 @@ _hash_readpage(IndexScanDesc scan, Buffer *bufP, ScanDirection dir)
 		so->currPos.buf = InvalidBuffer;
 	}
 
+	Assert(so->currPos.firstItem <= so->currPos.lastItem);
+	return true;
+}
+
+static bool
+_hash_readpage_new(IndexScanDesc scan, Buffer *bufP, ScanDirection dir)
+{
+	Relation	rel = scan->indexRelation;
+	HashScanOpaque so = (HashScanOpaque) scan->opaque;
+	Buffer		buf;
+	Page		page;
+	HashPageOpaque opaque;
+	OffsetNumber offnum, maxoff;
+	uint16		itemIndex;
+
+	buf = *bufP;
+	Assert(BufferIsValid(buf));
+	_hash_checkpage(rel, buf, LH_BUCKET_PAGE | LH_OVERFLOW_PAGE);
+	page = BufferGetPage(buf);
+	maxoff = PageGetMaxOffsetNumber(page);
+	opaque = HashPageGetOpaque(page);
+	
+	so->currPos.buf = buf;
+	so->currPos.currPage = BufferGetBlockNumber(buf);
+
+	Assert(ScanDirectionIsForward(dir));
+	BlockNumber prev_blkno;
+	while(true){
+		if(so->currPos.buf == so->hashso_bucket_buf)
+			prev_blkno = InvalidBlockNumber;
+		else
+			prev_blkno = opaque->hasho_prevblkno;
+		
+		offnum = _hash_binsearch_new2(page, so->hashso_sk_hash);
+		if(offnum == maxoff + 1){
+			/* goto next page */
+			Assert(so->numKilled == 0);
+			BlockNumber blkno=opaque->hasho_nextblkno;
+			if(buf == so->hashso_bucket_buf)
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			else
+				_hash_relbuf(rel, buf);
+			if(BlockNumberIsValid(blkno)){
+				buf=_hash_getbuf(rel, blkno, HASH_READ, LH_OVERFLOW_PAGE);
+				page = BufferGetPage(buf);
+				maxoff = PageGetMaxOffsetNumber(page);
+				opaque = HashPageGetOpaque(page);
+
+				so->currPos.buf = buf;
+				so->currPos.currPage = blkno;
+			}else{
+				so->currPos.prevPage = prev_blkno;
+				so->currPos.nextPage = InvalidBlockNumber;
+				so->currPos.buf = InvalidBuffer;;
+				return false;
+			}
+		}else{
+			IndexTuple itup = (IndexTuple)PageGetItem(page, PageGetItemId(page, offnum));
+			uint32 reverse_hashkey = pg_reverse_bits(_hash_get_indextuple_hashkey(itup));
+			if(reverse_hashkey > pg_reverse_bits(so->hashso_sk_hash)){
+				/* no item found */
+				if(buf == so->hashso_bucket_buf)
+					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				else
+					_hash_relbuf(rel, buf);
+				so->currPos.prevPage = prev_blkno;
+				so->currPos.nextPage = InvalidBlockNumber;
+				so->currPos.buf = InvalidBuffer;
+				return false;
+			}
+			/* found item and load */
+			itemIndex = _hash_load_qualified_items(scan, page, offnum, dir);
+			so->currPos.firstItem = 0;
+			so->currPos.lastItem = itemIndex - 1;
+			so->currPos.itemIndex = 0;
+			break;
+		}
+	}
+	if(so->currPos.buf == so->hashso_bucket_buf){
+		so->currPos.prevPage = InvalidBlockNumber;
+		so->currPos.nextPage = opaque->hasho_nextblkno;
+		LockBuffer(so->currPos.buf, BUFFER_LOCK_UNLOCK);
+	}else{
+		so->currPos.prevPage = opaque->hasho_prevblkno;
+		so->currPos.nextPage = opaque->hasho_nextblkno;
+		_hash_relbuf(rel, buf);
+		so->currPos.buf = InvalidBuffer;
+	}
 	Assert(so->currPos.firstItem <= so->currPos.lastItem);
 	return true;
 }

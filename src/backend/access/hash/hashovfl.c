@@ -802,6 +802,7 @@ _hash_initbitmapbuffer(Buffer buf, uint16 bmsize, bool initpage)
  *	Since this function is invoked in VACUUM, we provide an access strategy
  *	parameter that controls fetches of the bucket pages.
  */
+/* TODO: squeezebucket should be adapted to our bit-reversed order */
 void
 _hash_squeezebucket(Relation rel,
 					Bucket bucket,
