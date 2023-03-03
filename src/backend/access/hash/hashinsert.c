@@ -23,9 +23,12 @@
 #include "storage/lwlock.h"
 #include "storage/predicate.h"
 #include "utils/rel.h"
+#include "portability/instr_time.h"
 
 static void _hash_vacuum_one_page(Relation rel, Relation hrel,
 								  Buffer metabuf, Buffer buf);
+
+static uint64 expand_total = 0;
 
 /*
  *	_hash_doinsert() -- Handle insertion of a single index tuple.
@@ -33,7 +36,7 @@ static void _hash_vacuum_one_page(Relation rel, Relation hrel,
  *		This routine is called by the public interface routines, hashbuild
  *		and hashinsert.  By here, itup is completely filled in.
  */
-void
+bool
 _hash_doinsert(Relation rel, IndexTuple itup, Relation heapRel)
 {
 	Buffer		buf = InvalidBuffer;
@@ -49,6 +52,7 @@ _hash_doinsert(Relation rel, IndexTuple itup, Relation heapRel)
 	uint32		hashkey;
 	Bucket		bucket;
 	OffsetNumber itup_off;
+	bool ret = false;
 
 	/*
 	 * Get the hash key for the item (it's stored in the index tuple itself).
@@ -247,11 +251,20 @@ restart_insert:
 		_hash_dropbuf(rel, bucket_buf);
 
 	/* Attempt to split if a split is needed */
-	if (do_expand)
-		_hash_expandtable(rel, metabuf);
-
+	if (do_expand){
+		instr_time expand_start, expand_end, expand_diff;
+		INSTR_TIME_SET_CURRENT(expand_start);
+		ret = _hash_expandtable(rel, metabuf);
+		INSTR_TIME_SET_CURRENT(expand_end);
+		expand_diff = expand_end;
+		INSTR_TIME_SUBTRACT(expand_diff, expand_start);
+		expand_total += INSTR_TIME_GET_MICROSEC(expand_diff);
+		pg_fprintf(stderr, "total expand time cost: %llu microseconds\n", expand_total);
+	}
 	/* Finally drop our pin on the metapage */
 	_hash_dropbuf(rel, metabuf);
+
+	return ret;
 }
 
 /*

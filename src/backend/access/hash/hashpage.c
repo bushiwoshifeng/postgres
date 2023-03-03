@@ -33,6 +33,7 @@
 #include "access/xloginsert.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
+#include "portability/instr_time.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "storage/smgr.h"
@@ -610,7 +611,7 @@ _hash_pageinit(Page page, Size size)
  * The caller must hold a pin, but no lock, on the metapage buffer.
  * The buffer is returned in the same state.
  */
-void
+bool
 _hash_expandtable(Relation rel, Buffer metabuf)
 {
 	HashMetaPage metap;
@@ -630,6 +631,7 @@ _hash_expandtable(Relation rel, Buffer metabuf)
 	uint32		lowmask;
 	bool		metap_update_masks = false;
 	bool		metap_update_splitpoint = false;
+	bool ret = false;
 
 restart_expand:
 
@@ -944,23 +946,34 @@ restart_expand:
 	/* drop lock, but keep pin */
 	LockBuffer(metabuf, BUFFER_LOCK_UNLOCK);
 
+	instr_time split_start, split_end, split_diff;
+	INSTR_TIME_SET_CURRENT(split_start);
 	/* Relocate records to the new bucket */
 	_hash_splitbucket(rel, metabuf,
 					  old_bucket, new_bucket,
 					  buf_oblkno, buf_nblkno, NULL,
 					  maxbucket, highmask, lowmask);
+	INSTR_TIME_SET_CURRENT(split_end);
+	split_diff = split_end;
+	INSTR_TIME_SUBTRACT(split_diff, split_start);
+	uint64 elapsed = INSTR_TIME_GET_MICROSEC(split_diff);
+	if(elapsed > 10){
+		ret = true;
+		pg_fprintf(stderr, "maxbucket: %u, split cost %llu microsecond\n", maxbucket, elapsed);
+	}
 
 	/* all done, now release the pins on primary buckets. */
 	_hash_dropbuf(rel, buf_oblkno);
 	_hash_dropbuf(rel, buf_nblkno);
 
-	return;
+	return ret;
 
 	/* Here if decide not to split or fail to acquire old bucket lock */
 fail:
 
 	/* We didn't write the metapage, so just drop lock */
 	LockBuffer(metabuf, BUFFER_LOCK_UNLOCK);
+	return ret;
 }
 
 
@@ -1452,6 +1465,7 @@ _hash_finish_split(Relation rel, Buffer metabuf, Buffer obuf, Bucket obucket,
 	npage = BufferGetPage(bucket_nbuf);
 	npageopaque = HashPageGetOpaque(npage);
 	nbucket = npageopaque->hasho_bucket;
+
 
 	_hash_splitbucket(rel, metabuf, obucket,
 					  nbucket, obuf, bucket_nbuf, tidhtab,

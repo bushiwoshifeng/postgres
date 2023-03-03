@@ -29,6 +29,7 @@
 #include "miscadmin.h"
 #include "optimizer/plancat.h"
 #include "pgstat.h"
+#include "portability/instr_time.h"
 #include "utils/builtins.h"
 #include "utils/index_selfuncs.h"
 #include "utils/rel.h"
@@ -265,7 +266,15 @@ hashinsert(Relation rel, Datum *values, bool *isnull,
 	itup = index_form_tuple(RelationGetDescr(rel), index_values, index_isnull);
 	itup->t_tid = *ht_ctid;
 
-	_hash_doinsert(rel, itup, heapRel);
+	instr_time insert_start, insert_end, insert_diff;
+	INSTR_TIME_SET_CURRENT(insert_start);
+	bool ret = _hash_doinsert(rel, itup, heapRel);
+	INSTR_TIME_SET_CURRENT(insert_end);
+	insert_diff = insert_end;
+	INSTR_TIME_SUBTRACT(insert_diff, insert_start);
+	uint64 elapsed = INSTR_TIME_GET_MICROSEC(insert_diff);
+	if(ret)
+		pg_fprintf(stderr, "critical insert cost %llu microsecond\n", elapsed);
 
 	pfree(itup);
 
