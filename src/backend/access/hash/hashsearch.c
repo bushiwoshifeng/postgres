@@ -23,6 +23,7 @@
 #include "storage/predicate.h"
 #include "utils/rel.h"
 #include "port/pg_bitutils.h"
+#include "portability/instr_time.h"
 
 static bool _hash_readpage(IndexScanDesc scan, Buffer *bufP,
 						   ScanDirection dir);
@@ -461,8 +462,9 @@ _hash_readpage(IndexScanDesc scan, Buffer *bufP, ScanDirection dir)
 	Buffer		buf;
 	Page		page;
 	HashPageOpaque opaque;
-	OffsetNumber offnum;
+	// OffsetNumber offnum;
 	uint16		itemIndex;
+	instr_time load_start, load_end, load_diff;
 
 	buf = *bufP;
 	Assert(BufferIsValid(buf));
@@ -482,7 +484,13 @@ _hash_readpage(IndexScanDesc scan, Buffer *bufP, ScanDirection dir)
 			/* new page, locate starting position by binary search */
 			// offnum = _hash_binsearch(page, so->hashso_sk_hash);
 
+			INSTR_TIME_SET_CURRENT(load_start);
 			itemIndex = _hash_load_qualified_items_avx512(scan, page, dir);
+			INSTR_TIME_SET_CURRENT(load_end);
+			load_diff = load_end;
+			INSTR_TIME_SUBTRACT(load_diff, load_start);
+			uint64 elapsed = load_diff.tv_nsec;
+			pg_fprintf(stderr, "search page cost %llu nanoseconds, %hu items returned\n", elapsed, itemIndex);
 
 			if (itemIndex != 0)
 				break;

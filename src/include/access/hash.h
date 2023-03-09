@@ -81,7 +81,7 @@ typedef struct HashPageOpaqueData
 	Bucket		hasho_bucket;	/* bucket number this pg belongs to */
 	uint16		hasho_flag;		/* page type code + flag bits, see above */
 	uint16		hasho_page_id;	/* for identification of hash indexes */
-	uint8			control[MaxIndexTuplesPerPage];	/* for hashcode control byte storage */s
+	uint8			control[MaxIndexTuplesPerPage];	/* for hashcode control byte storage */
 } HashPageOpaqueData;
 
 typedef HashPageOpaqueData *HashPageOpaque;
@@ -359,7 +359,7 @@ typedef struct HashOptions
 #define HASHNProcs				3
 
 #define HASHKEY_CTL_MASK	0xFF000000
-#define HASHKEY_GETCTL(key)	(key & HASHKEY_CTL_MASK)
+#define HASHKEY_GETCTL(key)	(uint8)((key & HASHKEY_CTL_MASK) >> 24)
 
 /* public routines */
 

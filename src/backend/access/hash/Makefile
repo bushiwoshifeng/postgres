@@ -24,4 +24,6 @@ OBJS = \
 	hashutil.o \
 	hashvalidate.o
 
+hashsearch.o: CFLAGS+="-march=native"
+
 include $(top_srcdir)/src/backend/common.mk
