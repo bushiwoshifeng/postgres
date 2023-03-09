@@ -20,11 +20,12 @@
 #include "pgstat.h"
 #include "storage/predicate.h"
 #include "utils/rel.h"
+#include "portability/instr_time.h"
 
 static bool _hash_readpage(IndexScanDesc scan, Buffer *bufP,
 						   ScanDirection dir);
 static int	_hash_load_qualified_items(IndexScanDesc scan, Page page,
-									   OffsetNumber offnum, ScanDirection dir);
+									   /*OffsetNumber offnum,*/ ScanDirection dir);
 static inline void _hash_saveitem(HashScanOpaque so, int itemIndex,
 								  OffsetNumber offnum, IndexTuple itup);
 static void _hash_readnext(IndexScanDesc scan, Buffer *bufp,
@@ -456,8 +457,9 @@ _hash_readpage(IndexScanDesc scan, Buffer *bufP, ScanDirection dir)
 	Buffer		buf;
 	Page		page;
 	HashPageOpaque opaque;
-	OffsetNumber offnum;
+	// OffsetNumber offnum;
 	uint16		itemIndex;
+	instr_time load_start, load_end, load_diff;
 
 	buf = *bufP;
 	Assert(BufferIsValid(buf));
@@ -475,9 +477,16 @@ _hash_readpage(IndexScanDesc scan, Buffer *bufP, ScanDirection dir)
 		for (;;)
 		{
 			/* new page, locate starting position by binary search */
-			offnum = _hash_binsearch(page, so->hashso_sk_hash);
+			INSTR_TIME_SET_CURRENT(load_start);
+			
+			// offnum = _hash_binsearch(page, so->hashso_sk_hash);
+			itemIndex = _hash_load_qualified_items(scan, page, /*offnum,*/ dir);
 
-			itemIndex = _hash_load_qualified_items(scan, page, offnum, dir);
+			INSTR_TIME_SET_CURRENT(load_end);
+			load_diff = load_end;
+			INSTR_TIME_SUBTRACT(load_diff, load_start);
+			uint64 elapsed = load_diff.tv_nsec;
+			pg_fprintf(stderr, "search page cost %llu nanoseconds, %hu items returned\n", elapsed, itemIndex);
 
 			if (itemIndex != 0)
 				break;
@@ -534,9 +543,9 @@ _hash_readpage(IndexScanDesc scan, Buffer *bufP, ScanDirection dir)
 		for (;;)
 		{
 			/* new page, locate starting position by binary search */
-			offnum = _hash_binsearch_last(page, so->hashso_sk_hash);
+			// offnum = _hash_binsearch_last(page, so->hashso_sk_hash);
 
-			itemIndex = _hash_load_qualified_items(scan, page, offnum, dir);
+			itemIndex = _hash_load_qualified_items(scan, page, /*offnum,*/ dir);
 
 			if (itemIndex != MaxIndexTuplesPerPage)
 				break;
@@ -606,19 +615,21 @@ _hash_readpage(IndexScanDesc scan, Buffer *bufP, ScanDirection dir)
  */
 static int
 _hash_load_qualified_items(IndexScanDesc scan, Page page,
-						   OffsetNumber offnum, ScanDirection dir)
+						   /*OffsetNumber offnum,*/ ScanDirection dir)
 {
 	HashScanOpaque so = (HashScanOpaque) scan->opaque;
 	IndexTuple	itup;
 	int			itemIndex;
-	OffsetNumber maxoff;
+	OffsetNumber maxoff, offnum;
 
 	maxoff = PageGetMaxOffsetNumber(page);
+
 
 	if (ScanDirectionIsForward(dir))
 	{
 		/* load items[] in ascending order */
 		itemIndex = 0;
+		offnum = FirstOffsetNumber;
 
 		while (offnum <= maxoff)
 		{
@@ -646,14 +657,14 @@ _hash_load_qualified_items(IndexScanDesc scan, Page page,
 				_hash_saveitem(so, itemIndex, offnum, itup);
 				itemIndex++;
 			}
-			else
-			{
-				/*
-				 * No more matching tuples exist in this page. so, exit while
-				 * loop.
-				 */
-				break;
-			}
+			// else
+			// {
+			// 	/*
+			// 	 * No more matching tuples exist in this page. so, exit while
+			// 	 * loop.
+			// 	 */
+			// 	break;
+			// }
 
 			offnum = OffsetNumberNext(offnum);
 		}
@@ -665,6 +676,7 @@ _hash_load_qualified_items(IndexScanDesc scan, Page page,
 	{
 		/* load items[] in descending order */
 		itemIndex = MaxIndexTuplesPerPage;
+		offnum = maxoff;
 
 		while (offnum >= FirstOffsetNumber)
 		{
@@ -692,14 +704,14 @@ _hash_load_qualified_items(IndexScanDesc scan, Page page,
 				/* tuple is qualified, so remember it */
 				_hash_saveitem(so, itemIndex, offnum, itup);
 			}
-			else
-			{
-				/*
-				 * No more matching tuples exist in this page. so, exit while
-				 * loop.
-				 */
-				break;
-			}
+			// else
+			// {
+			// 	/*
+			// 	 * No more matching tuples exist in this page. so, exit while
+			// 	 * loop.
+			// 	 */
+			// 	break;
+			// }
 
 			offnum = OffsetNumberPrev(offnum);
 		}
