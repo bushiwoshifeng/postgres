@@ -322,4 +322,26 @@ pg_set_most_significant_bit_to_zero64(uint64* word)
 #endif
 }
 
+static inline void
+pg_set_most_significant_bit_to_zero32(uint32* word)
+{
+#ifdef HAVE__BUILTIN_CLZ
+	Assert(*word != 0);
+
+	*word &= ~(1UL << (31 - __builtin_clz(*word)));
+#else
+	uint64 mask = *word;
+
+  mask |= mask >> 1;
+  mask |= mask >> 2;
+  mask |= mask >> 4;
+	mask |= mask >> 8;
+  mask |= mask >> 16;
+
+  mask = mask >> 1;
+
+	*word &= mask;
+#endif
+}
+
 #endif							/* PG_BITUTILS_H */
